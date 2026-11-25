@@ -12,10 +12,12 @@ class PrefixReuse(unittest.TestCase):
     def test_tool_turn_retry_and_edit(self):
         import mlx.core as mx
 
-        from inkling.server import Runtime
+        from inkling.runtime import Runtime
 
         mx.set_cache_limit(512 * 1024**2)
-        runtime = Runtime(Path(os.environ["INKLING_ENGINE_SNAPSHOT"]))
+        runtime = Runtime(
+            Path(os.environ["INKLING_ENGINE_SNAPSHOT"]), context_window=50_000
+        )
         tools = [
             {
                 "type": "function",

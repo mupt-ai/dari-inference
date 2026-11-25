@@ -79,3 +79,12 @@ One active conversation is retained, with checkpoints at the decoded tip, the or
 - [Engine internals and direct Python usage](INDEPENDENT.md). The engine also accepts the MLX Community 4-bit layout, but it is not the checkpoint used in the quickstart.
 - [Benchmark protocols](benchmarks/README.md) and [official-weight performance results](benchmarks/results/official-weights.md). These measure engine execution, not HTTP or Pi overhead.
 - [Narrated optimization walkthrough](docs/explainer/README.md).
+
+## Add a model
+
+`dari_engine/catalog.py` is the source of truth for supported model names. A name selects one immutable checkpoint, its family backend, and its default context budget. The CLI and both HTTP APIs use the selected name. Each server process loads only that model and owns its prefix cache; to run two models at once, start them on different ports.
+
+- **Compatible checkpoint:** Add one `Model` entry to `MODELS` with the official `repository`, pinned commit `revision`, existing `backend`, and a tested `context_window`. No Go CLI, command parser, or HTTP changes. Confirm compatibility with the weight layout, kernel dimensions, tokenizer, and message format; sharing a publisher or family name alone is not sufficient.
+- **Different architecture:** Add a sibling package to `inkling/` with its own weight mapping, runtime, tokenizer logic, and kernels. Include the package and any shader files in `pyproject.toml`. Use `inkling/backend.py` as the adapter example: `resolve_snapshot(model, install)` checks local files unless explicitly pulling, `max_context(snapshot)` reads the checkpoint limit, and `load(snapshot, context_window)` returns the runtime. `inkling/runtime.py` shows the inference interface: `prompt`, `encode_raw`, and `events`, plus context and cached-token counts. Keep GPU initialization out of catalog imports so `list` and `show` remain lightweight.
+
+Before publishing a new entry, explicitly pull it, disconnect from the network, run `show` and `run`, and verify that `/v1/models` advertises its name and `/v1/chat/completions` returns a real answer with that name. Check prefix reuse, output correctness, and peak memory at the default context length against a reference implementation before claiming performance.

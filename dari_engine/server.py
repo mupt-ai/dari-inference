@@ -1,84 +1,11 @@
-"""Loopback-only, single-request text chat server for Dari's Metal engine."""
+"""Loopback HTTP transports for the selected Dari model."""
 
-import argparse
 import json
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 
-import mlx.core as mx
-from mlx_lm.utils import (
-    load_tokenizer,
-)  # Tokenization only; never loads the reference model.
-
-from inkling.chat_protocol import InvalidGeneration, assistant_events, prepare
-from inkling.cli import DEFAULT_CONTEXT_WINDOW, add_context_option
-from inkling.decode_message_gate import GatedModel
-from inkling.prefix_cache import PrefixCache
-
-MODEL = "inkling-2-mini"
-
-
-class Runtime:
-    def __init__(self, snapshot, context_window=DEFAULT_CONTEXT_WINDOW):
-        self.cache = PrefixCache()
-        config = json.loads((snapshot / "config.json").read_text())
-        maximum = config["text_config"]["model_max_length"]
-        if not 1 <= context_window <= maximum:
-            raise SystemExit(
-                f"--context-window must be between 1 and {maximum:,} tokens"
-            )
-        self.model_max_length = maximum
-        self.context_window = context_window
-        self.softcap = config["text_config"]["final_logit_softcapping"]
-        self.tokenizer = load_tokenizer(
-            snapshot, eos_token_ids=[config["eos_token_id"]]
-        )
-        self.model = GatedModel(snapshot)
-
-    def prompt(self, messages, tools):
-        ids = self.tokenizer.apply_chat_template(
-            messages,
-            tools=tools or None,
-            return_dict=False,
-            tokenize=True,
-            add_generation_prompt=False,
-            reasoning_effort="low" if tools else "none",
-        )
-        # With tools, let the model select text or a named invocation.
-        return ids + self.tokenizer.encode(
-            "<|message_model|>" + ("" if tools else "<|content_text|>"),
-            add_special_tokens=False,
-        )
-
-    def generate(self, ids, limit, temperature):
-        cursor = self.cache.resume(ids)
-        self.cached_tokens = len(cursor.tokens)
-        for offset in range(self.cached_tokens, len(ids), 1024):
-            chunk = ids[offset : offset + 1024]
-            cursor.logits = self.model(mx.array([chunk]), cursor.layers)
-            mx.eval(cursor.logits)
-            cursor.tokens.extend(chunk)
-            if 0 < len(ids) - len(cursor.tokens) <= 1024:
-                self.cache.block = cursor.checkpoint()
-        self.cache.prompt = cursor.checkpoint()
-        for _ in range(limit):
-            scores = cursor.logits.reshape(-1)
-            if temperature:
-                scores = mx.tanh(scores.astype(mx.float32) / self.softcap) * (
-                    self.softcap / temperature
-                )
-                token = mx.random.categorical(scores).item()
-            else:
-                token = mx.argmax(scores).item()
-            # Only publish evaluated state. The yielded token itself is not
-            # cached until generation resumes and the model consumes it.
-            self.cache.tip = cursor
-            yield token
-            self.cache.tip = None
-            cursor.logits = self.model(mx.array([[token]]), cursor.layers)
-            cursor.tokens.append(token)
+from dari_engine.protocol import InvalidGeneration, prepare
 
 
 class ChatHandler(BaseHTTPRequestHandler):
@@ -101,9 +28,9 @@ class ChatHandler(BaseHTTPRequestHandler):
                 "object": "list",
                 "data": [
                     {
-                        "id": MODEL,
+                        "id": self.server.model_name,
                         "object": "model",
-                        "owned_by": "thinkingmachines",
+                        "owned_by": self.server.model.repository.split("/", 1)[0],
                         "context_window": self.server.runtime.context_window,
                     }
                 ],
@@ -120,6 +47,8 @@ class ChatHandler(BaseHTTPRequestHandler):
             0
         ] not in ("localhost", "127.0.0.1"):
             return self.send_error(403, "Local chat clients only")
+        name = self.server.model_name
+        backend = self.server.model.backend
         runtime = self.server.runtime
         try:
             size = int(self.headers.get("Content-Length", 0))
@@ -128,25 +57,28 @@ class ChatHandler(BaseHTTPRequestHandler):
             request = json.loads(self.rfile.read(size))
             if self.path == "/api/show":
                 model = request.get("model") or request.get("name")
-                if model not in (MODEL, MODEL + ":latest"):
+                if model not in (name, name + ":latest"):
                     return self.reply(404, {"error": f"model {model!r} not found"})
                 return self.reply(
                     200,
                     {
                         "capabilities": ["completion"],
-                        "details": {"family": "inkling", "format": "safetensors"},
+                        "details": {
+                            "family": backend.FAMILY,
+                            "format": backend.WEIGHT_FORMAT,
+                        },
                         "model_info": {
-                            "general.architecture": "inkling",
-                            "inkling.context_length": runtime.model_max_length,
+                            "general.architecture": backend.FAMILY,
+                            f"{backend.FAMILY}.context_length": runtime.model_max_length,
                         },
                     },
                 )
             if native:
-                from inkling.ollama import generate
+                from dari_engine.ollama import generate
 
                 return generate(self, request)
-            if request["model"] != MODEL:
-                raise ValueError(f"Expected model {MODEL}")
+            if request["model"] != name:
+                raise ValueError(f"Expected model {name}")
             messages, tools = prepare(request)
             stream_options = request.get("stream_options") or {}
             if not isinstance(stream_options, dict):
@@ -177,14 +109,14 @@ class ChatHandler(BaseHTTPRequestHandler):
 
         meta = {
             "id": "chatcmpl-" + uuid.uuid4().hex,
-            "model": MODEL,
+            "model": name,
             "created": int(time.time()),
         }
-        output = assistant_events(
-            runtime.tokenizer,
-            runtime.generate(ids, limit, temperature),
-            {t["function"]["name"] for t in tools},
+        output = runtime.events(
+            ids,
             limit,
+            temperature,
+            {t["function"]["name"] for t in tools},
         )
 
         def usage(count):
@@ -262,27 +194,13 @@ class ChatHandler(BaseHTTPRequestHandler):
             pass  # The last completed prefix remains reusable.
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--snapshot", required=True, type=Path)
-    parser.add_argument("--port", type=int, default=8080)
-    add_context_option(parser)
-    args = parser.parse_args()
-    if not args.snapshot.is_dir():
-        parser.error("Expected an existing local snapshot directory")
-    serve(args.snapshot, args.port, args.context_window)
-
-
-def serve(snapshot, port, context_window):
-    mx.set_cache_limit(512 * 1024**2)
+def serve(name, model, snapshot, port, context_window):
     with HTTPServer(("127.0.0.1", port), ChatHandler) as server:
-        server.runtime = Runtime(snapshot, context_window)
+        server.model_name = name
+        server.model = model
+        server.runtime = model.backend.load(snapshot, context_window)
         print(
-            f"Dari GatedModel ready on port {port}; context: {context_window:,} tokens; weights: {snapshot}",
+            f"{name} ready on port {server.server_port}; context: {context_window:,} tokens; weights: {snapshot}",
             flush=True,
         )
         server.serve_forever()
-
-
-if __name__ == "__main__":
-    main()

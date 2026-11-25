@@ -4,7 +4,7 @@ import json
 import time
 from datetime import UTC, datetime
 
-from inkling.chat_protocol import InvalidGeneration, assistant_events, prepare
+from dari_engine.protocol import InvalidGeneration, prepare
 
 
 def supported(obj, keys):
@@ -32,7 +32,8 @@ def generate(handler, request):
             | ({"messages"} if chat else {"prompt", "system", "raw"}),
         )
         model = request["model"]
-        if model not in ("inkling-2-mini", "inkling-2-mini:latest"):
+        name = handler.server.model_name
+        if model not in (name, name + ":latest"):
             return handler.reply(404, {"error": f"model {model!r} not found"})
         options = request.get("options") or {}
         supported(options, {"num_ctx", "num_predict", "temperature"})
@@ -56,7 +57,7 @@ def generate(handler, request):
         if request.get("raw"):
             if "system" in request:
                 raise ValueError("raw prompts cannot include a system message")
-            ids = runtime.tokenizer.encode(request["prompt"], add_special_tokens=False)
+            ids = runtime.encode_raw(request["prompt"])
         else:
             ids = runtime.prompt(messages, [])
         remaining = window - len(ids)
@@ -84,10 +85,7 @@ def generate(handler, request):
         handler.end_headers()
     parts = []
     try:
-        tokens = runtime.generate(ids, limit, temperature)
-        for delta, reason, count in assistant_events(
-            runtime.tokenizer, tokens, set(), limit
-        ):
+        for delta, reason, count in runtime.events(ids, limit, temperature, set()):
             text = delta.get("content", "")
             if not stream:
                 parts.append(text)
